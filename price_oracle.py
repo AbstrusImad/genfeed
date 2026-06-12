@@ -1,6 +1,6 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
-PriceOracle — example Intelligent Contract for ``genlayer_free_connectors``.
+PriceOracle — example Intelligent Contract for ``GenFeed``.
 
 Demonstrates how to consume the Binance connector family from
 ``@gl.public.write`` methods and persist atto-scaled results in typed on-chain
@@ -14,6 +14,8 @@ Showcased connector calls:
     * ``get_24h_stats``          — daily high/low/volume snapshot
     * ``get_book_ticker``        — live bid/ask spread
     * ``get_server_time``        — decentralized clock heartbeat
+    * ``get_median_price``       — manipulation-resistant cross-market price
+    * ``is_price_safe``          — spot/avg/TWAP divergence guard before settling
 
 Storage conventions:
     * All prices are atto-scaled integers (value * 10**18), keyed by market
@@ -27,7 +29,7 @@ GenLayer deployment tool (see README).
 
 from genlayer import *
 
-from genlayer_free_connectors import BinanceConnector, ERROR_EXPECTED
+from genfeed import BinanceConnector, ERROR_EXPECTED
 
 
 class PriceOracle(gl.Contract):
@@ -102,6 +104,42 @@ class PriceOracle(gl.Contract):
     def heartbeat(self) -> None:
         """Record Binance server time — a free decentralized clock source."""
         self.last_heartbeat_ms = BinanceConnector.get_server_time()
+        self._bump()
+
+    # ------------------------------------------------------------------
+    # Composite "super-power" writes — derived primitives in one call
+    # ------------------------------------------------------------------
+
+    @gl.public.write
+    def update_robust_price(self, asset: str) -> None:
+        """Store a manipulation-resistant USD price (median across markets).
+
+        Pass a bare asset such as ``"BTC"``; the connector pulls it from
+        several stablecoin markets and stores the median, so no single market
+        can move the recorded price.
+        """
+        key = asset.strip().upper()
+        self._register(key)
+        self.prices_atto[key] = BinanceConnector.get_median_price(asset)
+        self._bump()
+
+    @gl.public.write
+    def settle_if_safe(self, symbol: str) -> None:
+        """Record the TWAP settlement price only if spot/avg/TWAP all agree.
+
+        Guards against settling on a wicked, depegged or manipulated price:
+        if the three readings diverge beyond the safety band, the write
+        reverts instead of locking a bad price on-chain.
+        """
+        report = BinanceConnector.is_price_safe(symbol)
+        if not report["safe"]:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Price unsafe to settle: "
+                f"{report['max_divergence_bps']} bps divergence"
+            )
+        key = symbol.strip().upper()
+        self._register(key)
+        self.twaps_atto[key] = u256(int(report["twap_atto"]))
         self._bump()
 
     # ------------------------------------------------------------------

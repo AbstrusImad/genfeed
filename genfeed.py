@@ -1,8 +1,8 @@
 """
-genlayer_free_connectors
-========================
+GenFeed
+=======
 
-Zero-key, zero-cost external-data connectors for GenLayer Intelligent Contracts.
+Zero-key, zero-cost external market-data for GenLayer Intelligent Contracts.
 
 Full coverage of the **Binance public market-data API** (no API key, no auth)
 from inside an Intelligent Contract — one line per reading:
@@ -117,6 +117,18 @@ _VALID_INTERVALS = {
     "1d", "3d", "1w", "1M",
 }
 
+# Heuristic thresholds for :meth:`BinanceConnector.get_liquidity_score`. These
+# are tunable scoring conventions, not exchange-defined values; they are named
+# constants (rather than magic numbers) so integrators can reason about and
+# re-derive the 0-100 score deterministically.
+_LIQ_SPREAD_MAX_BPS = 200        # spread at/above which the spread score is 0
+_LIQ_DEPTH_FULL_QUOTE = 1_000_000      # top-book quote depth scoring full marks
+_LIQ_VOLUME_FULL_QUOTE = 100_000_000   # 24h quote volume scoring full marks
+
+# Default stablecoin markets used by :meth:`BinanceConnector.get_median_price`
+# to build a manipulation-resistant USD price for an asset.
+_DEFAULT_MEDIAN_QUOTES = ("USDT", "USDC", "FDUSD")
+
 
 def to_atto(raw: str, *, error_prefix: str = ERROR_EXTERNAL) -> int:
     """Convert a decimal *string* to an atto-scaled integer (value * 10**18).
@@ -197,6 +209,18 @@ def _clean_symbol(symbol: str) -> str:
     return cleaned
 
 
+def _clean_asset(asset: str) -> str:
+    """Validate and normalize a single asset code (e.g. ``BTC``, ``USDT``).
+
+    Like :func:`_clean_symbol` but for one leg of a pair; the alphanumeric
+    restriction keeps it safe to concatenate into a market symbol and a URL.
+    """
+    cleaned = str(asset or "").strip().upper()
+    if not cleaned or len(cleaned) > 12 or not cleaned.isalnum():
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} Invalid asset code: '{asset}'")
+    return cleaned
+
+
 def _clean_interval(interval: str) -> str:
     """Validate a kline interval against the Binance whitelist."""
     cleaned = str(interval or "").strip()
@@ -222,6 +246,30 @@ def _clean_window(window_size: str) -> str:
         ):
             return cleaned
     raise gl.vm.UserError(f"{ERROR_EXPECTED} Invalid window size: '{window_size}'")
+
+
+def _clean_timezone(time_zone: str) -> str:
+    """Validate a Binance ``timeZone`` offset and URL-encode it.
+
+    Accepts whole hours (``"0"``, ``"-5"``, ``"8"``) or ``"HH:MM"``
+    (``"5:45"``), in Binance's supported ``-12:00``..``+14:00`` range. The
+    ``:`` is percent-encoded so the value is safe to interpolate into the URL.
+    """
+    raw = str(time_zone if time_zone is not None else "0").strip()
+    sign = ""
+    body = raw
+    if body[:1] in "+-":
+        sign = "-" if body[0] == "-" else ""
+        body = body[1:]
+    hours, _, minutes = body.partition(":")
+    if not hours.isdigit() or int(hours) > 14:
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} Invalid timeZone: '{time_zone}'")
+    if minutes and (len(minutes) != 2 or not minutes.isdigit() or int(minutes) >= 60):
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} Invalid timeZone minutes: '{time_zone}'")
+    cleaned = f"{sign}{int(hours)}"
+    if minutes:
+        cleaned += f"%3A{minutes}"
+    return cleaned
 
 
 def _check_range(value: int, lo: int, hi: int, what: str) -> int:
@@ -380,6 +428,25 @@ def _within_bps(a: int, b: int, tolerance_bps: int) -> bool:
     return abs(a_abs - b_abs) * 10_000 <= tolerance_bps * max(a_abs, b_abs)
 
 
+def _isqrt(n: int) -> int:
+    """Deterministic integer square root (floor) via integer Newton's method.
+
+    Implemented by hand rather than via ``math.isqrt`` so the library carries
+    no math-module dependency and the result is provably float-free and
+    bit-identical across validators (used by :meth:`get_volatility`).
+    """
+    if n < 0:
+        raise gl.vm.UserError(f"{ERROR_EXPECTED} isqrt of negative value")
+    if n == 0:
+        return 0
+    x = n
+    y = (x + 1) // 2
+    while y < x:
+        x = y
+        y = (x + n // x) // 2
+    return x
+
+
 def _agree_on_error(leaders_res, leader_fn) -> bool:
     """Canonical validator behaviour when the leader's closure errored.
 
@@ -493,12 +560,25 @@ class BinanceConnector:
     ``get_order_book_summary``     re-fetch + prices/volumes within bps
     ``get_24h_stats``              re-fetch + field-wise bps agreement
     ``get_rolling_stats``          re-fetch + field-wise bps agreement
+    ``get_trading_day_stats``      re-fetch + field-wise bps agreement
     ``get_klines``                 ``strict_eq`` when ``end_time_ms`` pinned;
                                    immutable-candle overlap rule otherwise
     ``get_twap``                   re-fetch + TWAP within bps (default 10)
     ``get_symbol_info``            ``strict_eq`` (stable metadata)
     ``get_server_time``            re-fetch + skew within N seconds
+    ``price_at``                   ``strict_eq`` (pinned past candle)
     =============================  =========================================
+
+    Composite "super-power" methods — ``get_asset_price``, ``convert``,
+    ``get_median_price``, ``value_basket``, ``is_price_safe``, ``check_peg``,
+    ``get_volatility``, ``get_trend``, ``get_liquidity_score`` and
+    ``get_execution_price`` — build higher-level financial primitives on top
+    of the raw endpoints. They issue **no direct non-deterministic calls**:
+    each composes already-validated readings (every ``get_*`` sub-call runs
+    its own equivalence-principle block, returning the leader-agreed value to
+    all nodes) and then applies pure integer arithmetic, so every validator
+    reproduces the derived result bit-for-bit. See the README for the full
+    composite table.
 
     Not exposed (and why): ``/ping`` carries no data; ``/trades`` and
     ``/aggTrades`` are per-trade streams that cannot reach meaningful
@@ -646,18 +726,26 @@ class BinanceConnector:
     @staticmethod
     def get_order_book_summary(
         symbol: str,
-        levels: int = 100,
+        levels: int = 500,
         price_tolerance_bps: int = DEFAULT_TOLERANCE_BPS,
-        volume_tolerance_bps: int = 2_000,
+        volume_tolerance_bps: int = 5_000,
     ) -> dict:
         """Aggregated liquidity over the top ``levels`` of the order book.
 
         Returns ``{"best_bid_atto", "best_ask_atto", "bid_volume_atto",
-        "ask_volume_atto", "levels"}``. Individual book levels churn far too
-        fast for consensus, so the connector aggregates: best prices agree
-        within ``price_tolerance_bps``; summed volumes within
-        ``volume_tolerance_bps`` (default 20% — top-of-book liquidity swings
-        hard between any two fetches).
+        "ask_volume_atto", "levels"}``.
+
+        Consensus note (measured against live Binance): best **prices** are
+        stable and agree within ``price_tolerance_bps``. Summed **volume** is
+        noise-dominated at shallow depth — the top ~20-100 levels can swing
+        60-95% between two fetches as small orders churn — but stabilises with
+        depth, because large resting orders dominate the sum (the top 500
+        levels swing only a few percent even over multi-second gaps). The
+        default therefore reads ``levels=500`` and accepts summed volume
+        within ``volume_tolerance_bps`` (50%), treating depth as a coarse
+        liquidity *magnitude*, not a precise figure. Request a shallow
+        ``levels`` only if you also raise ``volume_tolerance_bps``; for a
+        stable liquidity number prefer 24h quote volume (``get_24h_stats``).
         """
         _check_tolerance(price_tolerance_bps)
         _check_tolerance(volume_tolerance_bps)
@@ -913,3 +1001,456 @@ class BinanceConnector:
 
         ms = gl.vm.run_nondet_unsafe(fetch, _make_validator(fetch, agree))
         return u256(ms)
+
+    # ------------------------------------------------------------------
+    # Trading-day statistics — /api/v3/ticker/tradingDay
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_trading_day_stats(
+        symbol: str, time_zone: str = "0", tolerance_bps: int = 100
+    ) -> dict:
+        """Statistics for the current **calendar trading day**.
+
+        Same shape as :meth:`get_24h_stats`, but the window is the trading day
+        in ``time_zone`` (``"0"`` UTC, ``"-5"``, ``"8"``, ``"5:45"``) rather
+        than a rolling 24h. The day keeps accumulating until it closes, so it
+        is treated as live data: validators re-fetch and agree field-wise
+        within ``tolerance_bps`` (default 100 bps).
+        """
+        _check_tolerance(tolerance_bps)
+        cleaned = _clean_symbol(symbol)
+        tz = _clean_timezone(time_zone)
+        url = f"{_BASE}/ticker/tradingDay?symbol={cleaned}&timeZone={tz}"
+
+        def fetch() -> dict:
+            response = gl.nondet.web.get(url, headers=_JSON_HEADERS)
+            return _parse_stats_payload(_expect_object(response, url), url)
+
+        def agree(theirs, mine) -> bool:
+            return _stats_agree(theirs, mine, tolerance_bps)
+
+        return gl.vm.run_nondet_unsafe(fetch, _make_validator(fetch, agree))
+
+    # ==================================================================
+    # Composite / derived "super-power" methods
+    #
+    # Each method below builds a higher-level financial primitive on top of
+    # the raw endpoints. They contain NO direct non-deterministic calls:
+    # every external reading is obtained by calling another
+    # BinanceConnector.get_* method (which runs its own equivalence-principle
+    # block and returns the leader-agreed value to all nodes). The composite
+    # then applies pure integer arithmetic, so the derived result is
+    # reproduced identically on every validator.
+    # ==================================================================
+
+    @staticmethod
+    def get_asset_price(
+        asset: str, quote: str = "USDT", tolerance_bps: int = DEFAULT_TOLERANCE_BPS
+    ) -> u256:
+        """Price of one unit of ``asset`` denominated in ``quote`` (atto).
+
+        Tries the direct market ``{asset}{quote}``; if Binance has no such
+        symbol, falls back to the inverse market ``{quote}{asset}`` and
+        returns the reciprocal. ``asset == quote`` returns exactly 1.0
+        (``10**18``). This is the routing primitive behind :meth:`convert`
+        and :meth:`value_basket`.
+        """
+        base = _clean_asset(asset)
+        counter = _clean_asset(quote)
+        _check_tolerance(tolerance_bps)
+        if base == counter:
+            return u256(ATTO_SCALE)
+        try:
+            return BinanceConnector.get_price_with_tolerance(base + counter, tolerance_bps)
+        except gl.vm.UserError as exc:
+            msg = getattr(exc, "message", None) or str(exc)
+            if not msg.startswith(ERROR_EXTERNAL):
+                raise  # transient / expected errors must not be masked
+        # Direct market is unknown (deterministic 4xx): try the inverse market.
+        try:
+            inverse = int(
+                BinanceConnector.get_price_with_tolerance(counter + base, tolerance_bps)
+            )
+        except gl.vm.UserError:
+            raise gl.vm.UserError(
+                f"{ERROR_EXTERNAL} No market path for {base}->{counter} "
+                f"(tried {base}{counter} and {counter}{base})"
+            )
+        if inverse <= 0:
+            raise gl.vm.UserError(
+                f"{ERROR_EXTERNAL} Non-positive inverse price for {counter}{base}"
+            )
+        return u256((ATTO_SCALE * ATTO_SCALE) // inverse)
+
+    @staticmethod
+    def convert(
+        from_asset: str,
+        to_asset: str,
+        amount_atto: int,
+        quote: str = "USDT",
+        tolerance_bps: int = DEFAULT_TOLERANCE_BPS,
+    ) -> u256:
+        """Convert ``amount_atto`` units of ``from_asset`` into ``to_asset``.
+
+        Prices both legs against ``quote`` (default USDT, with inverse-market
+        fallback) so **any token can be valued in any other**, even without a
+        direct market. Returns the equivalent amount of ``to_asset`` (atto).
+        """
+        src = _clean_asset(from_asset)
+        dst = _clean_asset(to_asset)
+        _check_range(amount_atto, 0, _MAX_U256, "amount_atto")
+        if src == dst:
+            return u256(amount_atto)
+        price_from = int(BinanceConnector.get_asset_price(src, quote, tolerance_bps))
+        price_to = int(BinanceConnector.get_asset_price(dst, quote, tolerance_bps))
+        if price_to <= 0:
+            raise gl.vm.UserError(f"{ERROR_EXTERNAL} Non-positive price for {dst}")
+        # amount_atto * (quote/src) / (quote/dst) -> dst units, atto-scaled.
+        result = amount_atto * price_from // price_to
+        if result > _MAX_U256:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Converted amount exceeds u256 range")
+        return u256(result)
+
+    @staticmethod
+    def get_median_price(
+        asset: str,
+        quotes=None,
+        min_sources: int = 2,
+        tolerance_bps: int = DEFAULT_TOLERANCE_BPS,
+    ) -> u256:
+        """Manipulation-resistant USD price: median across stablecoin markets.
+
+        Pulls the same ``asset`` from several independent quote markets
+        (default ``USDT``/``USDC``/``FDUSD``) and returns the median, so a
+        single stale or manipulated market cannot move the result. Markets
+        that do not exist are skipped; at least ``min_sources`` must respond.
+        """
+        base = _clean_asset(asset)
+        raw_quotes = list(_DEFAULT_MEDIAN_QUOTES) if quotes is None else _plain(quotes)
+        markets = [_clean_asset(q) for q in raw_quotes]
+        if not markets or len(markets) > 8:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} quotes must list 1..8 markets")
+        _check_range(min_sources, 1, 8, "min_sources")
+        min_sources = min(min_sources, len(markets))
+
+        prices = []
+        for market in markets:
+            try:
+                prices.append(
+                    int(BinanceConnector.get_price_with_tolerance(base + market, tolerance_bps))
+                )
+            except gl.vm.UserError as exc:
+                msg = getattr(exc, "message", None) or str(exc)
+                if msg.startswith(ERROR_EXTERNAL):
+                    continue  # market does not exist (deterministic) -> skip
+                raise
+        if len(prices) < min_sources:
+            raise gl.vm.UserError(
+                f"{ERROR_EXTERNAL} Only {len(prices)} of {len(markets)} {base} "
+                f"markets available (need {min_sources})"
+            )
+        prices.sort()
+        n = len(prices)
+        mid = n // 2
+        median = prices[mid] if n % 2 == 1 else (prices[mid - 1] + prices[mid]) // 2
+        return u256(median)
+
+    @staticmethod
+    def value_basket(
+        holdings, quote: str = "USDT", tolerance_bps: int = DEFAULT_TOLERANCE_BPS
+    ) -> u256:
+        """Total value of a basket ``{asset: amount_atto}`` in ``quote`` (atto).
+
+        Prices an entire portfolio or index in a single call. Each leg is
+        priced with :meth:`get_asset_price` (direct or inverse market).
+        Capped at 20 legs to keep the per-transaction consensus cost bounded.
+        """
+        items = _plain(holdings)
+        if not isinstance(items, dict) or not items or len(items) > 20:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} holdings must map 1..20 assets to atto amounts"
+            )
+        counter = _clean_asset(quote)
+        total = 0
+        for asset, amount in items.items():
+            amount_atto = _check_range(int(amount), 0, _MAX_U256, f"amount for '{asset}'")
+            price = int(BinanceConnector.get_asset_price(asset, counter, tolerance_bps))
+            total += amount_atto * price // ATTO_SCALE
+            if total > _MAX_U256:
+                raise gl.vm.UserError(f"{ERROR_EXPECTED} Basket value exceeds u256 range")
+        return u256(total)
+
+    @staticmethod
+    def is_price_safe(symbol: str, max_divergence_bps: int = 100) -> dict:
+        """Cross-check spot vs 5-min average vs TWAP before settling.
+
+        Returns ``{"safe", "spot_atto", "avg_atto", "twap_atto",
+        "max_divergence_bps"}``. ``safe`` is True when all three readings
+        agree within ``max_divergence_bps`` — a guard against settling on a
+        single wicked / depegged / manipulated instantaneous price. Atto
+        values are strings (they routinely exceed JS safe-integer range).
+        """
+        cleaned = _clean_symbol(symbol)
+        _check_range(max_divergence_bps, 1, 10_000, "max_divergence_bps")
+        spot = int(BinanceConnector.get_price_with_tolerance(cleaned))
+        avg = int(BinanceConnector.get_avg_price(cleaned))
+        twap = int(BinanceConnector.get_twap(cleaned, "1h", 24))
+        readings = (spot, avg, twap)
+        worst = 0
+        for i in range(len(readings)):
+            for j in range(i + 1, len(readings)):
+                hi = max(readings[i], readings[j])
+                if hi > 0:
+                    divergence = abs(readings[i] - readings[j]) * 10_000 // hi
+                    if divergence > worst:
+                        worst = divergence
+        return {
+            "safe": worst <= max_divergence_bps,
+            "spot_atto": str(spot),
+            "avg_atto": str(avg),
+            "twap_atto": str(twap),
+            "max_divergence_bps": worst,
+        }
+
+    @staticmethod
+    def check_peg(
+        asset: str,
+        quote: str = "USDT",
+        target_atto: int = ATTO_SCALE,
+        max_bps: int = 50,
+        tolerance_bps: int = DEFAULT_TOLERANCE_BPS,
+    ) -> dict:
+        """Verify a stablecoin holds its peg.
+
+        Returns ``{"pegged", "price_atto", "target_atto", "deviation_bps"}``.
+        ``deviation_bps`` is ``|price - target| / target``. Defaults check that
+        ``asset`` trades within 50 bps of 1.0 ``quote`` — a safety gate before
+        accepting a stablecoin as collateral or settlement.
+        """
+        _check_range(target_atto, 1, _MAX_U256, "target_atto")
+        _check_range(max_bps, 1, 10_000, "max_bps")
+        price = int(BinanceConnector.get_asset_price(asset, quote, tolerance_bps))
+        deviation_bps = abs(price - target_atto) * 10_000 // target_atto
+        return {
+            "pegged": deviation_bps <= max_bps,
+            "price_atto": str(price),
+            "target_atto": str(target_atto),
+            "deviation_bps": deviation_bps,
+        }
+
+    @staticmethod
+    def get_volatility(symbol: str, interval: str = "1h", periods: int = 24) -> dict:
+        """Realized volatility from closed candles (pure integer math).
+
+        Computes close-to-close returns in bps over the last ``periods``
+        closed candles and returns their standard deviation. Output:
+        ``{"volatility_bps", "mean_return_bps", "samples", "interval"}``.
+        Useful for risk-based collateral, dynamic fees and insurance pricing.
+        """
+        cleaned = _clean_symbol(symbol)
+        cleaned_interval = _clean_interval(interval)
+        _check_range(periods, 2, 500, "periods")
+        candles = _plain(BinanceConnector.get_klines(cleaned, cleaned_interval, periods))
+        closes = [int(c["close_atto"]) for c in candles if int(c["close_atto"]) > 0]
+        if len(closes) < 2:
+            raise gl.vm.UserError(
+                f"{ERROR_EXTERNAL} Not enough candles for volatility of {cleaned}"
+            )
+        returns = [
+            (closes[i] - closes[i - 1]) * 10_000 // closes[i - 1]
+            for i in range(1, len(closes))
+        ]
+        n = len(returns)
+        mean = sum(returns) // n
+        variance = sum((r - mean) ** 2 for r in returns) // n
+        return {
+            "volatility_bps": _isqrt(variance),
+            "mean_return_bps": mean,
+            "samples": n,
+            "interval": cleaned_interval,
+        }
+
+    @staticmethod
+    def get_trend(
+        symbol: str,
+        interval: str = "1h",
+        periods: int = 24,
+        flat_band_bps: int = 50,
+    ) -> dict:
+        """Simple moving-average trend signal.
+
+        Compares the latest close to the SMA of the last ``periods`` closed
+        candles. Returns ``{"trend", "last_atto", "sma_atto",
+        "deviation_bps"}`` where ``trend`` is ``"up"``/``"down"``/``"flat"``
+        (flat inside ±``flat_band_bps``). Drives auto-resolving
+        "did X move up/down?" prediction markets.
+        """
+        cleaned = _clean_symbol(symbol)
+        cleaned_interval = _clean_interval(interval)
+        _check_range(periods, 2, 500, "periods")
+        _check_range(flat_band_bps, 0, 10_000, "flat_band_bps")
+        candles = _plain(BinanceConnector.get_klines(cleaned, cleaned_interval, periods))
+        closes = [int(c["close_atto"]) for c in candles if int(c["close_atto"]) > 0]
+        if not closes:
+            raise gl.vm.UserError(f"{ERROR_EXTERNAL} No candle closes for {cleaned}")
+        sma = sum(closes) // len(closes)
+        last = closes[-1]
+        deviation_bps = (last - sma) * 10_000 // sma if sma > 0 else 0
+        if deviation_bps > flat_band_bps:
+            trend = "up"
+        elif deviation_bps < -flat_band_bps:
+            trend = "down"
+        else:
+            trend = "flat"
+        return {
+            "trend": trend,
+            "last_atto": str(last),
+            "sma_atto": str(sma),
+            "deviation_bps": deviation_bps,
+        }
+
+    @staticmethod
+    def get_liquidity_score(symbol: str, levels: int = 500) -> dict:
+        """Blend spread, top-book depth and 24h volume into a 0-100 score.
+
+        A transparent, tunable health indicator (not an exchange metric):
+
+        * spread component (0-40): 0 bps -> 40, ``>= _LIQ_SPREAD_MAX_BPS`` -> 0
+        * depth component  (0-30): top-book quote depth vs ``_LIQ_DEPTH_FULL_QUOTE``
+        * volume component (0-30): 24h quote volume vs ``_LIQ_VOLUME_FULL_QUOTE``
+
+        Returns the score plus every input so callers can re-derive it. Run it
+        before settling a large position to confirm the market can absorb it.
+        """
+        cleaned = _clean_symbol(symbol)
+        book = _plain(BinanceConnector.get_order_book_summary(cleaned, levels))
+        stats = _plain(BinanceConnector.get_24h_stats(cleaned))
+
+        best_bid = int(book["best_bid_atto"])
+        best_ask = int(book["best_ask_atto"])
+        mid = (best_bid + best_ask) // 2
+        spread_bps = ((best_ask - best_bid) * 10_000 // mid) if mid > 0 else _LIQ_SPREAD_MAX_BPS
+        depth_quote = (int(book["bid_volume_atto"]) + int(book["ask_volume_atto"])) * mid // ATTO_SCALE
+        volume_quote = int(stats["quote_volume_atto"])
+
+        depth_units = depth_quote // ATTO_SCALE
+        volume_units = volume_quote // ATTO_SCALE
+
+        spread_score = max(0, 40 - (spread_bps * 40 // _LIQ_SPREAD_MAX_BPS))
+        depth_score = min(30, depth_units * 30 // _LIQ_DEPTH_FULL_QUOTE)
+        volume_score = min(30, volume_units * 30 // _LIQ_VOLUME_FULL_QUOTE)
+
+        return {
+            "score": spread_score + depth_score + volume_score,
+            "spread_bps": spread_bps,
+            "depth_quote_atto": str(depth_quote),
+            "volume_24h_quote_atto": str(volume_quote),
+            "components": {
+                "spread": spread_score,
+                "depth": depth_score,
+                "volume": volume_score,
+            },
+        }
+
+    @staticmethod
+    def get_execution_price(
+        symbol: str,
+        side: str,
+        base_amount_atto: int,
+        levels: int = 100,
+        tolerance_bps: int = 100,
+    ) -> dict:
+        """Volume-weighted fill price for a given order size (walks the book).
+
+        ``side`` is ``"buy"`` (consume asks) or ``"sell"`` (consume bids).
+        Walks up to ``levels`` of real order-book depth to compute the average
+        price you would actually pay/receive for ``base_amount_atto`` base
+        units — not the headline top-of-book price. Returns ``{"filled",
+        "avg_price_atto", "filled_base_atto", "requested_base_atto",
+        "quote_cost_atto", "levels_used"}``. Validators re-fetch; ``filled``
+        must match and ``avg_price`` agree within ``tolerance_bps``.
+        """
+        cleaned = _clean_symbol(symbol)
+        cleaned_side = str(side or "").strip().lower()
+        if cleaned_side not in ("buy", "sell"):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} side must be 'buy' or 'sell'")
+        _check_range(base_amount_atto, 1, _MAX_U256, "base_amount_atto")
+        _check_range(levels, 1, 5_000, "levels")
+        _check_tolerance(tolerance_bps)
+        url = f"{_BASE}/depth?symbol={cleaned}&limit={levels}"
+
+        def fetch() -> dict:
+            response = gl.nondet.web.get(url, headers=_JSON_HEADERS)
+            payload = _expect_object(response, url)
+            side_key = "asks" if cleaned_side == "buy" else "bids"
+            book = _field(payload, side_key, url)
+            if not isinstance(book, list) or not book:
+                raise gl.vm.UserError(f"{ERROR_EXTERNAL} Empty {side_key} from {url}")
+            remaining = base_amount_atto
+            quote_cost = 0
+            filled_base = 0
+            used = 0
+            for level in book:
+                price_atto = to_atto(str(level[0]))
+                qty_atto = to_atto(str(level[1]))
+                used += 1
+                take = qty_atto if qty_atto < remaining else remaining
+                quote_cost += take * price_atto // ATTO_SCALE
+                filled_base += take
+                remaining -= take
+                if remaining <= 0:
+                    break
+            avg_price = (quote_cost * ATTO_SCALE // filled_base) if filled_base > 0 else 0
+            return {
+                "filled": remaining <= 0,
+                "avg_price_atto": avg_price,
+                "filled_base_atto": filled_base,
+                "requested_base_atto": base_amount_atto,
+                "quote_cost_atto": quote_cost,
+                "levels_used": used,
+            }
+
+        def agree(theirs, mine) -> bool:
+            if not isinstance(theirs, dict) or not isinstance(mine, dict):
+                return False
+            if bool(theirs.get("filled")) != bool(mine.get("filled")):
+                return False
+            return _within_bps(
+                int(theirs.get("avg_price_atto", -1)),
+                int(mine.get("avg_price_atto", -2)),
+                tolerance_bps,
+            )
+
+        return gl.vm.run_nondet_unsafe(fetch, _make_validator(fetch, agree))
+
+    @staticmethod
+    def price_at(symbol: str, timestamp_ms: int, interval: str = "1m") -> u256:
+        """Byte-exact closing price at a past ``timestamp_ms`` (epoch ms).
+
+        Pins the kline window's ``endTime`` so the result is fully
+        deterministic (``strict_eq``): every validator fetches the identical
+        immutable candle. Returns the close of the candle covering
+        ``timestamp_ms``. Use a **past** timestamp — a still-open candle may
+        fail consensus and rotate the leader. Ideal for settling options /
+        bets at a fixed expiry against a tamper-proof historical price.
+        """
+        cleaned = _clean_symbol(symbol)
+        cleaned_interval = _clean_interval(interval)
+        _check_range(timestamp_ms, 1, 4_102_444_800_000, "timestamp_ms")  # <= year 2100
+        url = (
+            f"{_BASE}/klines?symbol={cleaned}&interval={cleaned_interval}"
+            f"&endTime={timestamp_ms}&limit=1"
+        )
+
+        def fetch() -> int:
+            response = gl.nondet.web.get(url, headers=_JSON_HEADERS)
+            rows = _expect_array(response, url)
+            if not rows:
+                raise gl.vm.UserError(
+                    f"{ERROR_EXTERNAL} No candle at {timestamp_ms} for {cleaned}"
+                )
+            candles = _parse_klines_payload(rows, url)
+            return int(candles[-1]["close_atto"])
+
+        return u256(gl.eq_principle.strict_eq(fetch))

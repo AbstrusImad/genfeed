@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Bundle the connectors library and the example contract into one file.
+"""Bundle the GenFeed library and the example contract into one file.
 
 GenLayer deployment tools commonly take a single contract file. This script
-inlines ``genlayer_free_connectors.py`` into ``price_oracle.py`` and writes a
+inlines ``genfeed.py`` into ``price_oracle.py`` and writes a
 self-contained, deploy-ready artifact to ``dist/price_oracle.bundle.py``:
 
     line 1   pinned runner header (taken from the contract)
@@ -16,11 +16,11 @@ Usage:
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LIBRARY = ROOT / "genlayer_free_connectors.py"
+LIBRARY = ROOT / "genfeed.py"
 CONTRACT = ROOT / "price_oracle.py"
 OUTPUT = ROOT / "dist" / "price_oracle.bundle.py"
 
-LIB_IMPORT_PREFIX = "from genlayer_free_connectors import"
+LIB_IMPORT_PREFIX = "from genfeed import"
 
 
 def main() -> None:
@@ -33,7 +33,7 @@ def main() -> None:
     body: list[str] = []
     for line in contract_lines[1:]:
         if line.startswith(LIB_IMPORT_PREFIX):
-            body.append("# (genlayer_free_connectors inlined above by scripts/bundle.py)")
+            body.append("# (genfeed inlined above by scripts/bundle.py)")
         else:
             body.append(line)
 
