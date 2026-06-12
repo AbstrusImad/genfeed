@@ -6,11 +6,13 @@
 #   bash install-skill.sh          # from a local clone
 #
 # Supported tools (auto-detected):
-#   Claude Code  ->  .claude/skills/genfeed.md
-#   Cursor       ->  .cursor/rules/genfeed.md
+#   Claude Code    ->  .claude/skills/genfeed.md
+#   Cursor         ->  .cursor/rules/genfeed.md
+#   Codex CLI      ->  AGENTS.md           (appended with header)
+#   Gemini CLI     ->  GEMINI.md           (appended with header)
 #   GitHub Copilot ->  .github/copilot-instructions.md  (appended with header)
-#   Windsurf     ->  .windsurfrules  (appended with header)
-#   Cline / Roo  ->  .clinerules    (appended with header)
+#   Windsurf       ->  .windsurfrules      (appended with header)
+#   Cline / Roo    ->  .clinerules         (appended with header)
 
 set -euo pipefail
 
@@ -78,6 +80,34 @@ if [ -f ".windsurfrules" ]; then
     printf '%s' "$SEPARATOR" >> ".windsurfrules"
     cat "$TMPFILE" >> ".windsurfrules"
     echo "  [+] Windsurf       ->  .windsurfrules  (appended)"
+    INSTALLED=$((INSTALLED + 1))
+fi
+
+# ---- Codex CLI (OpenAI) -----------------------------------------------------
+
+if [ -f "AGENTS.md" ] || command -v codex &>/dev/null; then
+    if [ -f "AGENTS.md" ]; then
+        printf '%s' "$SEPARATOR" >> "AGENTS.md"
+        cat "$TMPFILE" >> "AGENTS.md"
+        echo "  [+] Codex CLI      ->  AGENTS.md  (appended)"
+    else
+        cp "$TMPFILE" "AGENTS.md"
+        echo "  [+] Codex CLI      ->  AGENTS.md  (created)"
+    fi
+    INSTALLED=$((INSTALLED + 1))
+fi
+
+# ---- Gemini CLI (Google) ----------------------------------------------------
+
+if [ -f "GEMINI.md" ] || command -v gemini &>/dev/null; then
+    if [ -f "GEMINI.md" ]; then
+        printf '%s' "$SEPARATOR" >> "GEMINI.md"
+        cat "$TMPFILE" >> "GEMINI.md"
+        echo "  [+] Gemini CLI     ->  GEMINI.md  (appended)"
+    else
+        cp "$TMPFILE" "GEMINI.md"
+        echo "  [+] Gemini CLI     ->  GEMINI.md  (created)"
+    fi
     INSTALLED=$((INSTALLED + 1))
 fi
 

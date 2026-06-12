@@ -52,6 +52,8 @@ The script auto-detects which tools are in your project and installs to the righ
 | --- | --- |
 | **Claude Code** | `.claude/skills/genfeed.md` (always) |
 | **Cursor** | `.cursor/rules/genfeed.md` (if `.cursor/` detected) |
+| **Codex CLI** | `AGENTS.md` (if `codex` in PATH or file exists) |
+| **Gemini CLI** | `GEMINI.md` (if `gemini` in PATH or file exists) |
 | **GitHub Copilot** | `.github/copilot-instructions.md` (if `.github/` detected) |
 | **Windsurf** | `.windsurfrules` (if file detected) |
 | **Cline / Roo** | `.clinerules` (if file detected) |

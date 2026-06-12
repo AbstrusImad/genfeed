@@ -7,6 +7,8 @@
 # Supported tools (auto-detected):
 #   Claude Code    ->  .claude\skills\genfeed.md
 #   Cursor         ->  .cursor\rules\genfeed.md
+#   Codex CLI      ->  AGENTS.md                        (appended with header)
+#   Gemini CLI     ->  GEMINI.md                        (appended with header)
 #   GitHub Copilot ->  .github\copilot-instructions.md  (appended with header)
 #   Windsurf       ->  .windsurfrules                   (appended with header)
 #   Cline / Roo    ->  .clinerules                      (appended with header)
@@ -68,6 +70,34 @@ if (Test-Path ".github") {
 if (Test-Path ".windsurfrules") {
     Add-Content -Path ".windsurfrules" -Value ($SEPARATOR + $SKILL_CONTENT) -Encoding UTF8
     Write-Host "  [+] Windsurf       ->  .windsurfrules  (appended)"
+    $INSTALLED++
+}
+
+# ---- Codex CLI (OpenAI) -----------------------------------------------------
+
+$codexInstalled = (Test-Path "AGENTS.md") -or ($null -ne (Get-Command codex -ErrorAction SilentlyContinue))
+if ($codexInstalled) {
+    if (Test-Path "AGENTS.md") {
+        Add-Content -Path "AGENTS.md" -Value ($SEPARATOR + $SKILL_CONTENT) -Encoding UTF8
+        Write-Host "  [+] Codex CLI      ->  AGENTS.md  (appended)"
+    } else {
+        Copy-Item $TMPFILE "AGENTS.md" -Force
+        Write-Host "  [+] Codex CLI      ->  AGENTS.md  (created)"
+    }
+    $INSTALLED++
+}
+
+# ---- Gemini CLI (Google) ----------------------------------------------------
+
+$geminiInstalled = (Test-Path "GEMINI.md") -or ($null -ne (Get-Command gemini -ErrorAction SilentlyContinue))
+if ($geminiInstalled) {
+    if (Test-Path "GEMINI.md") {
+        Add-Content -Path "GEMINI.md" -Value ($SEPARATOR + $SKILL_CONTENT) -Encoding UTF8
+        Write-Host "  [+] Gemini CLI     ->  GEMINI.md  (appended)"
+    } else {
+        Copy-Item $TMPFILE "GEMINI.md" -Force
+        Write-Host "  [+] Gemini CLI     ->  GEMINI.md  (created)"
+    }
     $INSTALLED++
 }
 
