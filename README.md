@@ -403,3 +403,7 @@ Adding a connector for any other free API is mechanical — copy the Binance pat
 ## Links
 
 [GenLayer](https://genlayer.com) · [Documentation](https://docs.genlayer.com) · [SDK API reference](https://sdk.genlayer.com) · [GenLayer Skills](https://skills.genlayer.com/) · [Builders Portal](https://portal.genlayer.foundation/)
+
+---
+
+Built by [@iAbstrus](https://x.com/iAbstrus) — follow for updates.
