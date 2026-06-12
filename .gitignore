@@ -1,0 +1,14 @@
+# Build artifacts (regenerate with: python scripts/bundle.py)
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
