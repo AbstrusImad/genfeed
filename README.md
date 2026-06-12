@@ -14,6 +14,9 @@ clock  = BinanceConnector.get_server_time()              # u256 epoch ms
 [![GenVM](https://img.shields.io/badge/GenVM-validated_live-5ad17a?style=flat-square)](#validation--linting)
 [![Runner](https://img.shields.io/badge/runner-pinned_hash-f5c542?style=flat-square)](#compatibility-verified-on-the-live-testnet)
 [![APIs](https://img.shields.io/badge/APIs-100%25_free_·_no_keys-61dafb?style=flat-square)](#endpoint-coverage)
+[![Website](https://img.shields.io/badge/website-abstrusimad.github.io%2Fgenfeed-00ff9c?style=flat-square)](https://abstrusimad.github.io/genfeed/)
+
+**🌐 Live site: [abstrusimad.github.io/genfeed](https://abstrusimad.github.io/genfeed/)**
 
 ---
 
