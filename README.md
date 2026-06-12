@@ -19,6 +19,7 @@ clock  = BinanceConnector.get_server_time()              # u256 epoch ms
 
 ## Contents
 
+- [Add to your AI assistant](#add-to-your-ai-assistant) — one command, works with Claude Code, Cursor, Copilot, Windsurf…
 - [Install & set up](#install--set-up) — add it to your project (no pip, no keys, no env)
 - [Your first contract](#your-first-contract) — a working oracle in 3 steps, with deploy commands
 - [Endpoint coverage](#endpoint-coverage) — every raw Binance public endpoint
@@ -28,6 +29,34 @@ clock  = BinanceConnector.get_server_time()              # u256 epoch ms
 - [Atto scale](#atto-scale-in-30-seconds) · [Error semantics](#error-semantics)
 - [Deployment](#deployment) · [Validation, linting & live test](#validation--linting)
 - [Compatibility notes](#compatibility-verified-on-the-live-testnet) · [Extending the library](#extending-the-library)
+
+---
+
+## Add to your AI assistant
+
+One command installs the GenFeed skill into your AI coding assistant. After installation it knows every method signature, return shape, atto-scale math, error taxonomy, consensus rules, and the full deployment workflow — without reading the README.
+
+```bash
+# macOS / Linux / Git Bash
+curl -fsSL https://raw.githubusercontent.com/AbstrusImad/genfeed/main/install-skill.sh | bash
+```
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/AbstrusImad/genfeed/main/install-skill.ps1 | iex
+```
+
+The script auto-detects which tools are in your project and installs to the right place:
+
+| Tool | Installed to |
+| --- | --- |
+| **Claude Code** | `.claude/skills/genfeed.md` (always) |
+| **Cursor** | `.cursor/rules/genfeed.md` (if `.cursor/` detected) |
+| **GitHub Copilot** | `.github/copilot-instructions.md` (if `.github/` detected) |
+| **Windsurf** | `.windsurfrules` (if file detected) |
+| **Cline / Roo** | `.clinerules` (if file detected) |
+
+The skill file is also available standalone at [`genfeed.skill.md`](genfeed.skill.md) — copy it manually to any tool not listed above.
 
 ---
 
